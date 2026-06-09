@@ -3,10 +3,11 @@
 #
 #   ./repro.sh
 #
-# Run 1: relay drops UDP datagrams > 1250 B (any sub-1265 path MTU does this
-#        to webrtc-rs's full-size SCTP packets) -> receiver gets exactly one
-#        message, then permanent silence.
-# Run 2: same path, relay transparent (60000)  -> all ten messages arrive.
+# Run 1: relay emulates a 1280-byte link (WireGuard/Tailscale, IPv6 floor) ->
+#        webrtc-rs's full-size SCTP packet is a 1293-byte IPv4 packet, doesn't
+#        fit, gets dropped -> receiver gets exactly one message, then permanent
+#        silence.
+# Run 2: same path, relay --mtu 60000 (transparent) -> all ten messages arrive.
 #
 # Prereqs: rust toolchain, python3, node with `npm install` done in headless/
 # (or NODE_PATH pointing at a node_modules that has playwright + its chromium).
@@ -29,9 +30,9 @@ PIDS+=($!)
 sleep 0.5
 
 run_pass() {
-  local max_datagram="$1" expect="$2" label="$3"
+  local mtu="$1" expect="$2" label="$3"
   echo
-  echo "== $label (max-datagram=$max_datagram) =="
+  echo "== $label (mtu=$mtu) =="
   "$ROOT/rust-sender/target/release/rust-sender" \
     --server "$SERVER" --room mre --advertise-ip 127.0.0.2 \
     --keepalive-secs 45 >/tmp/mre-sender.log 2>&1 &
@@ -42,7 +43,7 @@ run_pass() {
     sleep 1
   done
   local out
-  out="$(SERVER="$SERVER" node "$ROOT/headless/run-answerer.js" "$max_datagram")"
+  out="$(SERVER="$SERVER" node "$ROOT/headless/run-answerer.js" "$mtu")"
   echo "$out"
   kill "$sender_pid" 2>/dev/null || true
   if echo "$out" | grep -q "final:.*$expect"; then
@@ -53,8 +54,8 @@ run_pass() {
   fi
 }
 
-run_pass 1250  "Received 1 message(s)"  "blackhole run"
+run_pass 1280  "Received 1 message(s)"  "blackhole run"
 run_pass 60000 "Received 10 message(s)" "control run"
 
 echo
-echo "== A/B complete: same path, only --max-datagram differed =="
+echo "== A/B complete: same path, only --mtu differed =="

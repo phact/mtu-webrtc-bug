@@ -43,12 +43,15 @@ cd headless && npm install && npx playwright install chromium && cd ..
 
 `repro.sh` runs the full A/B:
 
-- **Blackhole run** — `blackhole-relay` (a tiny UDP forwarder) drops
-  datagrams over 1250 bytes, simulating any sub-1265 path MTU. The
-  headless Chromium receiver gets exactly **one** message
-  (`Received 1 message(s): p2claw-res-1`), then silence, while the
-  relay logs the same 1265-byte datagram retransmitted into the hole.
-- **Control run** — same path, relay threshold 60000: all ten messages
+- **Blackhole run** — `blackhole-relay` (a tiny UDP forwarder) emulates
+  a **1280-byte link** (the WireGuard/Tailscale MTU and the IPv6 floor):
+  it drops a datagram when its IPv4 packet (20 IP + 8 UDP + payload)
+  exceeds 1280, exactly as a real link of that MTU would. webrtc-rs's
+  full-size SCTP packet is a 1293-byte IPv4 packet, so it never fits.
+  The headless Chromium receiver gets exactly **one** message
+  (`Received 1 message(s): p2claw-res-1`), then silence, while the relay
+  logs the same 1293-byte packet retransmitted into the hole.
+- **Control run** — same path, relay `--mtu 60000`: all ten messages
   arrive in under three seconds.
 
 Components:
@@ -58,8 +61,9 @@ Components:
   frame (~220 B) then one ~8 KiB `DATA` frame, over an ordered data
   channel. (The frames are length-prefixed in a small custom framing;
   any payload large enough to fragment behaves the same.)
-- `blackhole-relay/` — UDP relay with two faces; drops datagrams whose
-  payload exceeds `--max-datagram`, forwards the rest, logs drops.
+- `blackhole-relay/` — UDP relay with two faces; drops a datagram when
+  its IPv4 packet (28 B headers + payload) exceeds `--mtu`, forwards the
+  rest, logs drops.
 - `headless/run-answerer.js` — Playwright Chromium receiver.
 - `answerer.html` / `offerer.html` / `rust-offerer.html` — interactive
   browser pages for manual two-device runs.

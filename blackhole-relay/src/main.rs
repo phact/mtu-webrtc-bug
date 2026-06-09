@@ -1,7 +1,8 @@
-//! UDP relay that simulates a path-MTU blackhole: datagrams whose payload
-//! exceeds --max-datagram are silently dropped (with a log line), everything
-//! else is forwarded. Two faces, one per peer; each face learns its peer's
-//! address from the most recent datagram it received.
+//! UDP relay that simulates a path-MTU blackhole: a datagram is dropped when
+//! the IP packet it would ride in (IP + UDP headers + payload) exceeds --mtu,
+//! exactly as a real link of that MTU would drop it. Everything that fits is
+//! forwarded. Two faces, one per peer; each face learns its peer's address
+//! from the most recent datagram it received.
 //!
 //! Point the WebRTC sender's advertised candidate at --sender-face and the
 //! answerer's rewritten candidate at --answerer-face, so all traffic crosses
@@ -13,10 +14,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-const USAGE: &str = "blackhole-relay --sender-face IP:PORT --answerer-face IP:PORT --max-datagram BYTES
+const USAGE: &str = "blackhole-relay --sender-face IP:PORT --answerer-face IP:PORT --mtu BYTES
 
-  Drops UDP datagrams whose payload exceeds --max-datagram. Set it absurdly
-  high (e.g. 60000) for a transparent control run.";
+  Drops a datagram when IP+UDP headers + payload exceed --mtu, exactly as a
+  real link of that MTU would. The faces here are IPv4 loopback, so the
+  header overhead is 28 bytes (20 IPv4 + 8 UDP). Pass the real tunnel number,
+  e.g. --mtu 1280 (WireGuard/Tailscale, IPv6 floor). Set it absurdly high
+  (e.g. 60000) for a transparent control run.";
+
+/// IPv4 (20) + UDP (8). The relay faces are 127.0.0.x, so this is the
+/// per-datagram header overhead a real IPv4 link would add. (IPv6 would be 48.)
+const IPV4_UDP_OVERHEAD: usize = 28;
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}; use --help");
@@ -26,7 +34,7 @@ fn die(msg: &str) -> ! {
 fn main() {
     let mut sender_face: Option<SocketAddr> = None;
     let mut answerer_face: Option<SocketAddr> = None;
-    let mut max_datagram: Option<usize> = None;
+    let mut mtu: Option<usize> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -43,16 +51,16 @@ fn main() {
                 let v = args.next().unwrap_or_else(|| die("missing value for --answerer-face"));
                 answerer_face = Some(v.parse().unwrap_or_else(|_| die("bad --answerer-face")));
             }
-            "--max-datagram" => {
-                let v = args.next().unwrap_or_else(|| die("missing value for --max-datagram"));
-                max_datagram = Some(v.parse().unwrap_or_else(|_| die("--max-datagram must be a number")));
+            "--mtu" => {
+                let v = args.next().unwrap_or_else(|| die("missing value for --mtu"));
+                mtu = Some(v.parse().unwrap_or_else(|_| die("--mtu must be a number")));
             }
             other => die(&format!("unknown argument {other}")),
         }
     }
 
-    let (Some(sender_face), Some(answerer_face), Some(max_datagram)) =
-        (sender_face, answerer_face, max_datagram)
+    let (Some(sender_face), Some(answerer_face), Some(mtu)) =
+        (sender_face, answerer_face, mtu)
     else {
         eprintln!("{USAGE}");
         exit(2);
@@ -62,7 +70,7 @@ fn main() {
     let answerer_sock = Arc::new(UdpSocket::bind(answerer_face).expect("bind answerer face"));
 
     println!(
-        "blackhole-relay up: sender-face={sender_face} answerer-face={answerer_face} max-datagram={max_datagram} bytes"
+        "blackhole-relay up: sender-face={sender_face} answerer-face={answerer_face} mtu={mtu} bytes (drops when {IPV4_UDP_OVERHEAD}+payload > mtu)"
     );
 
     // Last-seen peer address per face, learned from inbound traffic.
@@ -78,7 +86,7 @@ fn main() {
         Arc::clone(&answerer_sock),
         Arc::clone(&sender_peer),
         Arc::clone(&answerer_peer),
-        max_datagram,
+        mtu,
         Arc::clone(&dropped),
         Arc::clone(&largest_dropped),
     );
@@ -88,7 +96,7 @@ fn main() {
         sender_sock,
         answerer_peer,
         sender_peer,
-        max_datagram,
+        mtu,
         dropped,
         largest_dropped,
     );
@@ -104,7 +112,7 @@ fn pump(
     tx_sock: Arc<UdpSocket>,
     rx_peer: Arc<Mutex<Option<SocketAddr>>>,
     tx_peer: Arc<Mutex<Option<SocketAddr>>>,
-    max_datagram: usize,
+    mtu: usize,
     dropped: Arc<AtomicU64>,
     largest_dropped: Arc<AtomicU64>,
 ) -> thread::JoinHandle<()> {
@@ -122,11 +130,13 @@ fn pump(
                 };
                 *rx_peer.lock().unwrap() = Some(src);
 
-                if len > max_datagram {
+                // What a real link sees: the full IPv4 packet, not just the payload.
+                let packet_len = len + IPV4_UDP_OVERHEAD;
+                if packet_len > mtu {
                     let n = dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                    let largest = largest_dropped.fetch_max(len as u64, Ordering::Relaxed).max(len as u64);
+                    let largest = largest_dropped.fetch_max(packet_len as u64, Ordering::Relaxed).max(packet_len as u64);
                     println!(
-                        "[{label}] blackholed {len} bytes (bytes {len} > max {max_datagram})\t dropped={n} largest_dropped={largest}B"
+                        "[{label}] blackholed {len}B payload ({packet_len}B IPv4 packet > mtu {mtu})\t dropped={n} largest_dropped={largest}B"
                     );
                     continue;
                 }

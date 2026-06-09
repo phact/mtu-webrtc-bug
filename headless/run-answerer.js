@@ -11,13 +11,13 @@
 //     otherwise own its own candidate port on every loopback alias);
 //   - the relay is started in between, once both face addresses are known.
 //
-// Usage: node run-answerer.js [max-datagram]   (default 1250)
+// Usage: node run-answerer.js [mtu]   (default 1280, the WireGuard/Tailscale MTU)
 // Env:   SERVER=http://127.0.0.1:8000  signaling server base URL
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const path = require("path");
 
-const MAX_DATAGRAM = process.argv[2] || "1250";
+const MTU = process.argv[2] || "1280";
 const SERVER = process.env.SERVER || "http://127.0.0.1:8000";
 const RELAY_PORT = 47111;
 const RELAY_BIN = path.join(
@@ -83,7 +83,7 @@ const RELAY_BIN = path.join(
     relay = spawn(RELAY_BIN, [
       "--sender-face", `127.0.0.3:${RELAY_PORT}`,
       "--answerer-face", `127.0.0.2:${psPort}`,
-      "--max-datagram", MAX_DATAGRAM,
+      "--mtu", MTU,
     ]);
     relay.stdout.on("data", (d) => process.stdout.write("RELAY  " + d));
     relay.stderr.on("data", (d) => process.stdout.write("RELAY! " + d));
