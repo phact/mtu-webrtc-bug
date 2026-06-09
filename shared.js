@@ -131,16 +131,19 @@ export async function getSignalInfo() {
 }
 
 export function chooseAdvertiseIp(info, role) {
-  const host = location.hostname;
+  const host = stripBrackets(location.hostname);
   if (role === "answerer" && isUsableIp(info.client_ip)) return info.client_ip;
   if (isUsableIp(host)) return host;
 
   const serverIps = (info.server_ips || []).map((item) => item.ip).filter(isUsableIp);
+  // This harness exists to exercise the constrained (tunnel) path, so the
+  // tunnel addresses come FIRST: Tailscale v6, then Tailscale v4, then LAN.
   return (
+    serverIps.find(isTailscaleV6) ||
+    serverIps.find(isTailscaleIp) ||
     serverIps.find((ip) => ip.startsWith("10.")) ||
     serverIps.find((ip) => ip.startsWith("192.168.")) ||
     serverIps.find((ip) => /^172\.(1[6-9]|2\d|3[01])\./.test(ip)) ||
-    serverIps.find(isTailscaleIp) ||
     serverIps[0] ||
     ""
   );
@@ -171,13 +174,32 @@ export function rewriteMdnsHostCandidates(desc, advertiseIp, log) {
   return { type: desc.type, sdp };
 }
 
+function stripBrackets(value) {
+  return typeof value === "string" ? value.replace(/^\[|\]$/g, "") : value;
+}
+
 function isUsableIp(value) {
-  return /^\d+\.\d+\.\d+\.\d+$/.test(value) && !value.startsWith("127.") && value !== "0.0.0.0";
+  if (typeof value !== "string") return false;
+  const v = stripBrackets(value);
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(v)) {
+    return !v.startsWith("127.") && v !== "0.0.0.0";
+  }
+  // IPv6 literal: usable unless loopback or link-local.
+  if (v.includes(":")) {
+    const low = v.toLowerCase();
+    return low !== "::1" && !low.startsWith("fe80");
+  }
+  return false;
 }
 
 function isTailscaleIp(value) {
   const parts = value.split(".").map(Number);
   return parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127;
+}
+
+function isTailscaleV6(value) {
+  // Tailscale's ULA prefix.
+  return value.toLowerCase().startsWith("fd7a:115c:a1e0:");
 }
 
 export async function waitForSignal(room, kind, log, timeoutMs = 120000) {

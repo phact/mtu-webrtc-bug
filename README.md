@@ -2,10 +2,12 @@
 
 A minimal, fully local reproduction of a silent, permanent WebRTC
 data-channel stall: a [webrtc-rs](https://github.com/webrtc-rs/webrtc)
-sender on any path whose effective MTU is below ~1293 bytes (IPv4) —
-for example a WireGuard/Tailscale tunnel at the common 1280 MTU —
-delivers small messages fine and **never delivers any message large
-enough to fragment**, with no error surfaced to either side.
+sender emits packets larger than common path MTUs (e.g. the 1280-byte
+WireGuard/Tailscale tunnel MTU), so delivery of any message big enough
+to fragment depends entirely on IP fragmentation surviving the path.
+On a path that drops or refuses fragments, small messages are
+delivered fine and **no fragmented message is ever delivered**, with
+no error surfaced to either side.
 
 ## The mechanism
 
@@ -20,10 +22,21 @@ A full-size SCTP packet becomes a **1265-byte UDP payload** on the wire
 (measured: 1228 + 13 DTLS header + 8 explicit nonce + 16 AEAD tag),
 i.e. a 1293-byte IPv4 packet or 1313-byte IPv6 packet. Both exceed
 1280 — the IPv6 minimum MTU, and the tunnel MTU used by
-WireGuard-family VPNs. On such a path:
+WireGuard-family VPNs.
 
-1. every full-size fragment is dropped by the link; the ICMP error is
-   never read by the userspace stack;
+On a healthy path the sending host's kernel rescues this: it splits
+the oversized packet into IP fragments at the tun boundary and the
+receiver reassembles (verified with tcpdump on a real Tailscale link —
+DF is not set, fragments flow, data arrives). The failure mode needs a
+path where that rescue does not happen. IP fragmentation is exactly
+the mechanism the internet drops most capriciously (see RFC 8900, "IP
+Fragmentation Considered Fragile"): firewalls and middleboxes drop
+fragments by policy (non-first fragments carry no ports), IPv6
+fragments ride extension headers that are widely filtered, and
+userspace tunnel stacks have had patchy reassembly support. On any
+such path:
+
+1. the full-size fragments never arrive; nothing tells the sender why;
 2. SCTP reliably retransmits the same-size chunks into the same hole;
 3. on an ordered channel, every later message — however small —
    head-of-line blocks behind the wedged one.
@@ -31,8 +44,14 @@ WireGuard-family VPNs. On such a path:
 Net effect: `send()` succeeds, `bufferedAmount` climbs and freezes,
 the receiver gets nothing, the session eventually dies. It presents as
 "the app is blank on this one device" — this repro was originally
-built chasing exactly that, on an iPad that turned out to be on
-Tailscale. The receiver (WebKit) was innocent.
+built chasing exactly that, in production: an iPad on Tailscale where
+the receiver's wire counters froze at ~2 KB while the sender's buffer
+sat full, i.e. the fragments demonstrably never arrived. The receiver
+(WebKit) was innocent, and the fragment-dropping condition on that
+path has since disappeared and resists re-creation — which is the
+point: a sender that depends on fragmentation fails at the mercy of
+path conditions it can neither see nor control. `blackhole-relay`
+below models the fragment-hostile case deterministically.
 
 ## One-command repro (Linux, no VPN, no extra devices)
 
@@ -84,14 +103,26 @@ crosses the path you think you're testing before trusting any result.
 
 The original field configuration: sender on a host with a Tailscale
 interface, receiver a browser on a device whose selected ICE pair rides
-the tunnel (MTU 1280). Run `server.py`, open `rust-offerer.html` on the
-sender machine and `answerer.html` on the device, and use the
-advertise-IP controls to pin the candidate addresses to the tunnel.
-No relay is needed in this mode — the tunnel itself is the blackhole.
-Small frames arrive; 8 KiB frames never do. Capture `pc.getStats()` on
-the receiver: the data channel's `messagesReceived` freezes, and the
-transport stops receiving bytes once the first full-size fragment is
-dropped.
+the tunnel (MTU 1280). Run `server.py` (binds dual-stack), open
+`rust-offerer.html` on the sender machine and `answerer.html` on the
+device, and use the advertise-IP controls to pin the candidate
+addresses to the tunnel (the picker prefers the Tailscale addresses,
+v6 first; loading the answerer via `http://[<v6 addr>]:8000/` forces
+the v6 pair).
+
+Caveat from our own attempts: a real tunnel only reproduces the stall
+**while its path is fragment-hostile**. On a healthy path the sender's
+kernel fragments at the tun and the receiver reassembles, so all
+frames arrive (we verified this with tcpdump on both the v4 and v6
+Tailscale pairs — including the exact pair that failed in production
+weeks earlier). The production failure mode is real (receiver wire
+counters frozen while the sender buffer sat full: fragments never
+arrived) but the path condition that caused it is transient and may
+not be present when you test. That is why `blackhole-relay` exists:
+it makes the fragment-hostile case deterministic. If the tunnel run
+does stall for you, capture `pc.getStats()` on the receiver — the data
+channel's `messagesReceived` freezing while transport bytes stop is
+the signature.
 
 ## Fix directions (upstream)
 

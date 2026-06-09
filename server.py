@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import socket
 import subprocess
 import threading
 import time
@@ -373,8 +374,10 @@ def add_int_arg(cmd, payload, key, flag, minimum, maximum):
     cmd.extend([flag, str(value)])
 
 def server_ipv4_addresses():
+    # v4 + v6 (name kept for the existing call site). Skips loopback and
+    # link-local; includes ULA so Tailscale's fd7a:: shows up.
     try:
-        data = json.loads(subprocess.check_output(["ip", "-j", "-4", "addr"], text=True))
+        data = json.loads(subprocess.check_output(["ip", "-j", "addr"], text=True))
     except Exception:
         return []
 
@@ -385,18 +388,31 @@ def server_ipv4_addresses():
         ifname = item.get("ifname", "")
         for info in item.get("addr_info", []):
             addr = info.get("local")
-            if not addr or addr.startswith("127."):
+            if not addr:
                 continue
-            addresses.append({"interface": ifname, "ip": addr})
+            if addr.startswith("127.") or addr == "::1" or addr.lower().startswith("fe80"):
+                continue
+            family = "v6" if ":" in addr else "v4"
+            addresses.append({"interface": ifname, "ip": addr, "family": family})
     return addresses
+
+class DualStackHTTPServer(ThreadingHTTPServer):
+    # Bind v6 with V6ONLY off so one socket serves both families.
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
 
 def main():
     parser = argparse.ArgumentParser(description="Static WebRTC MRE server with tiny in-memory signaling.")
-    parser.add_argument("--bind", default="0.0.0.0")
+    parser.add_argument("--bind", default="::")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    server = ThreadingHTTPServer((args.bind, args.port), Handler)
+    cls = DualStackHTTPServer if ":" in args.bind else ThreadingHTTPServer
+    server = cls((args.bind, args.port), Handler)
     print(f"Serving static files and signaling on http://{args.bind}:{args.port}/", flush=True)
     server.serve_forever()
 
