@@ -1,0 +1,8 @@
+{
+  "name": "mtu-webrtc-bug-headless",
+  "private": true,
+  "description": "Headless Chromium answerer for the PMTU-blackhole repro",
+  "dependencies": {
+    "playwright": "^1.49"
+  }
+}

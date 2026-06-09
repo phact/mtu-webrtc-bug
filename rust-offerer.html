@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Rust Sender: WebRTC fragmented data channel MRE</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; padding: 24px; line-height: 1.4; }
+      main { max-width: 1100px; margin: 0 auto; display: grid; gap: 16px; }
+      h1 { margin: 0; font-size: 1.6rem; }
+      nav { display: flex; flex-wrap: wrap; gap: 12px; }
+      a { color: inherit; }
+      section { display: grid; gap: 8px; }
+      label { font-weight: 700; }
+      input, select, pre, output { box-sizing: border-box; width: 100%; border: 1px solid #8886; border-radius: 6px; padding: 10px; font: 13px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; }
+      pre { min-height: 360px; max-height: 560px; overflow: auto; white-space: pre-wrap; }
+      output { display: block; min-height: 42px; overflow-wrap: anywhere; }
+      button { width: max-content; padding: 8px 12px; border-radius: 6px; border: 1px solid #5558; font: inherit; cursor: pointer; }
+      button:disabled { cursor: wait; opacity: 0.65; }
+      .controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; align-items: end; }
+      .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+      .option { display: flex; gap: 8px; align-items: center; font-weight: 400; }
+      .option input { width: 18px; height: 18px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <nav>
+        <a href="./answerer.html">Answerer</a>
+        <a href="./offerer.html">Browser Offerer Control</a>
+      </nav>
+      <h1>Rust Sender: WebRTC fragmented data channel MRE</h1>
+      <output id="status">Idle.</output>
+
+      <section>
+        <label for="summary">Run summary</label>
+        <output id="summary">No run yet.</output>
+      </section>
+
+      <section class="controls">
+        <label>Room
+          <input id="room" value="mre" autocomplete="off" spellcheck="false">
+        </label>
+        <label>Advertise sender IP
+          <input id="advertiseIp" autocomplete="off" spellcheck="false" placeholder="auto">
+        </label>
+        <label>Payload mode
+          <select id="payloadMode">
+            <option value="p2claw" selected>p2claw frames</option>
+            <option value="raw">raw labeled messages</option>
+          </select>
+        </label>
+        <label>Pairs
+          <input id="pairs" type="number" min="1" max="200" value="4">
+        </label>
+        <label>Response bytes
+          <input id="responseSize" type="number" min="23" max="2000000" value="220">
+        </label>
+        <label>Body bytes
+          <input id="bodySize" type="number" min="1" max="2000000" value="8192">
+        </label>
+        <label>Tail bytes
+          <input id="tailSize" type="number" min="0" max="2000000" value="100">
+        </label>
+        <label>Keepalive seconds
+          <input id="keepaliveSecs" type="number" min="0" max="600" value="20">
+        </label>
+        <label class="option">
+          <input id="rewriteMdns" type="checkbox" checked>
+          Rewrite mDNS after gathering
+        </label>
+        <label class="option">
+          <input id="useStun" type="checkbox">
+          Use public STUN
+        </label>
+      </section>
+
+      <section class="actions">
+        <button id="start">Start Rust sender</button>
+        <button id="stop">Stop Rust sender</button>
+      </section>
+
+      <section>
+        <label for="log">Rust sender output</label>
+        <pre id="log"></pre>
+      </section>
+    </main>
+
+    <script type="module">
+      import { chooseAdvertiseIp, getSignalInfo, setStatus } from "./shared.js?v=24";
+
+      const els = {
+        advertiseIp: document.querySelector("#advertiseIp"),
+        bodySize: document.querySelector("#bodySize"),
+        keepaliveSecs: document.querySelector("#keepaliveSecs"),
+        log: document.querySelector("#log"),
+        payloadMode: document.querySelector("#payloadMode"),
+        pairs: document.querySelector("#pairs"),
+        responseSize: document.querySelector("#responseSize"),
+        rewriteMdns: document.querySelector("#rewriteMdns"),
+        room: document.querySelector("#room"),
+        start: document.querySelector("#start"),
+        status: document.querySelector("#status"),
+        stop: document.querySelector("#stop"),
+        summary: document.querySelector("#summary"),
+        tailSize: document.querySelector("#tailSize"),
+        useStun: document.querySelector("#useStun"),
+      };
+
+      let pollTimer;
+
+      initAdvertiseIp();
+      pollStatus();
+      pollTimer = setInterval(pollStatus, 750);
+      window.addEventListener("pagehide", () => clearInterval(pollTimer));
+      els.start.addEventListener("click", startRustSender);
+      els.stop.addEventListener("click", stopRustSender);
+
+      async function initAdvertiseIp() {
+        try {
+          const info = await getSignalInfo();
+          const ip = chooseAdvertiseIp(info, "offerer");
+          els.advertiseIp.value = ip;
+          setStatus(els.status, `Advertise sender IP default=${ip || "none"}`);
+        } catch (error) {
+          setStatus(els.status, error.message);
+        }
+      }
+
+      async function startRustSender() {
+        els.start.disabled = true;
+        try {
+          const response = await fetch("/rust-sender/start", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              room: value(els.room, "mre"),
+              advertise_ip: value(els.advertiseIp, ""),
+              payload_mode: els.payloadMode.value,
+              pairs: numberValue(els.pairs),
+              response_size: numberValue(els.responseSize),
+              body_size: numberValue(els.bodySize),
+              tail_size: numberValue(els.tailSize),
+              keepalive_secs: numberValue(els.keepaliveSecs),
+              rewrite_mdns: els.rewriteMdns.checked,
+              stun: els.useStun.checked,
+            }),
+          });
+          const data = await response.json();
+          if (!response.ok || !data.ok) throw new Error(data.error || `Start failed: ${response.status}`);
+          renderStatus(data);
+        } catch (error) {
+          setStatus(els.status, error.message);
+        } finally {
+          els.start.disabled = false;
+        }
+      }
+
+      async function stopRustSender() {
+        els.stop.disabled = true;
+        try {
+          const response = await fetch("/rust-sender/stop", { method: "POST" });
+          const data = await response.json();
+          if (!response.ok || !data.ok) throw new Error(data.error || `Stop failed: ${response.status}`);
+          renderStatus(data);
+        } catch (error) {
+          setStatus(els.status, error.message);
+        } finally {
+          els.stop.disabled = false;
+        }
+      }
+
+      async function pollStatus() {
+        try {
+          const response = await fetch("/rust-sender/status");
+          const data = await response.json();
+          if (!response.ok || !data.ok) throw new Error(data.error || `Status failed: ${response.status}`);
+          renderStatus(data);
+        } catch (error) {
+          setStatus(els.status, error.message);
+        }
+      }
+
+      function renderStatus(data) {
+        const args = data.args ? data.args.join(" ") : "not started";
+        const state = data.running ? "running" : data.returncode === null ? "idle" : `exited ${data.returncode}`;
+        const summary = summarizeRun(data.lines || []);
+        const summaryText = summary.compact ? ` ${summary.compact}.` : "";
+        setStatus(els.status, `Rust sender ${state}.${summaryText} ${args}`);
+        els.summary.textContent = summary.detail;
+        els.log.textContent = (data.lines || []).join("\n");
+        els.log.scrollTop = els.log.scrollHeight;
+      }
+
+      function summarizeRun(lines) {
+        const reqStreams = new Set();
+        const sentLabels = [];
+        let sentBytes = 0;
+        let bigFrames = 0;
+        let smallFrames = 0;
+        let answered = null;
+        let connected = false;
+        let open = false;
+
+        for (const line of lines) {
+          if (line.includes("pc state: connected")) connected = true;
+          if (line.includes("data channel open")) open = true;
+
+          const req = line.match(/received p2claw req stream_id=(\d+) byteLength=(\d+)/);
+          if (req) reqStreams.add(req[1]);
+
+          const sent = line.match(/sent label=([^ ]+) mode=([^ ]+) byteLength=(\d+)/);
+          if (sent) {
+            const byteLength = Number.parseInt(sent[3], 10);
+            sentLabels.push(sent[1]);
+            sentBytes += byteLength;
+            if (byteLength > 1200) bigFrames += 1;
+            else smallFrames += 1;
+          }
+
+          const answeredMatch = line.match(/answered (\d+) p2claw request stream/);
+          if (answeredMatch) answered = Number.parseInt(answeredMatch[1], 10);
+        }
+
+        if (!lines.length) {
+          return { compact: "", detail: "No run yet." };
+        }
+
+        const reqList = Array.from(reqStreams).sort((a, b) => Number(a) - Number(b));
+        const compactParts = [];
+        if (connected) compactParts.push("pc connected");
+        if (open) compactParts.push("dc open");
+        if (reqStreams.size) compactParts.push(`req=${reqStreams.size}`);
+        if (sentLabels.length) compactParts.push(`sent=${sentLabels.length}`);
+        if (answered !== null) compactParts.push(`answered=${answered}`);
+
+        const detailParts = [];
+        detailParts.push(`pc=${connected ? "connected" : "not connected"}`);
+        detailParts.push(`dc=${open ? "open" : "not open"}`);
+        detailParts.push(`requests=${reqStreams.size}${reqList.length ? ` streams=${reqList.join(",")}` : ""}`);
+        detailParts.push(`sent=${sentLabels.length} frames small<=1200:${smallFrames} big>1200:${bigFrames} bytes=${sentBytes}`);
+        if (answered !== null) detailParts.push(`answered=${answered}`);
+        if (sentLabels.length) detailParts.push(`labels=${sentLabels.join(", ")}`);
+
+        return {
+          compact: compactParts.join(" "),
+          detail: detailParts.join(" | "),
+        };
+      }
+
+      function value(input, fallback) {
+        const text = input.value.trim();
+        return text || fallback;
+      }
+
+      function numberValue(input) {
+        return Number.parseInt(input.value, 10);
+      }
+    </script>
+  </body>
+</html>

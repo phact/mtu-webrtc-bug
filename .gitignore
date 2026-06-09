@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+target/
+node_modules/
+diagnostics/
+# working notes for the upstream issue; not part of the public repro
+webrtc-rs-issue-draft.md
+.blackhole-logs/

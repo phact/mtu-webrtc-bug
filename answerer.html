@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WebRTC Fragmented Data Channel MRE - Answerer</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; padding: 24px; line-height: 1.4; }
+      main { max-width: 1100px; margin: 0 auto; display: grid; gap: 16px; }
+      h1 { margin: 0; font-size: 1.6rem; }
+      nav { display: flex; flex-wrap: wrap; gap: 12px; }
+      a { color: inherit; }
+      section { display: grid; gap: 8px; }
+      label { font-weight: 700; }
+      input, textarea, pre, output { box-sizing: border-box; width: 100%; border: 1px solid #8886; border-radius: 6px; padding: 10px; font: 13px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace; }
+      textarea { min-height: 150px; resize: vertical; }
+      pre { min-height: 280px; max-height: 420px; overflow: auto; white-space: pre-wrap; }
+      output { display: block; min-height: 42px; overflow-wrap: anywhere; }
+      button { width: max-content; padding: 8px 12px; border-radius: 6px; border: 1px solid #5558; font: inherit; cursor: pointer; }
+      button:disabled { cursor: wait; opacity: 0.65; }
+      .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+      .controls label { display: grid; gap: 6px; min-width: 180px; }
+      .option { display: flex; gap: 8px; align-items: center; font-weight: 400; }
+      .option input { width: 18px; height: 18px; }
+      .ip-field { min-width: 170px; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; align-items: start; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <nav>
+        <a href="./rust-offerer.html">Rust Sender Control</a>
+        <a href="./offerer.html">Browser Offerer Control</a>
+      </nav>
+      <h1>Answerer: WebRTC fragmented data channel MRE</h1>
+      <output id="status">Idle.</output>
+
+      <div class="controls">
+        <label>Room
+          <input id="room" value="mre" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="ip-field">Advertise receiver IP
+          <input id="advertiseIp" autocomplete="off" spellcheck="false" placeholder="auto">
+        </label>
+        <label class="option">
+          <input id="rewriteMdns" type="checkbox" checked>
+          Replace .local ICE names with IPs
+        </label>
+        <label class="option">
+          <input id="useStun" type="checkbox">
+          Use public STUN for connectivity test
+        </label>
+        <button id="join">Join receiver</button>
+        <button id="sendDiagnostics" type="button">Send diagnostics</button>
+      </div>
+
+      <div class="grid">
+        <section>
+          <label for="offer">Received offer</label>
+          <textarea id="offer" readonly spellcheck="false"></textarea>
+        </section>
+
+        <section>
+          <label for="answer">Published answer</label>
+          <textarea id="answer" readonly spellcheck="false"></textarea>
+        </section>
+      </div>
+
+      <section>
+        <label for="currentStats">Current stats</label>
+        <output id="currentStats">No stats yet.</output>
+      </section>
+
+      <section>
+        <label for="log">Trace log</label>
+        <pre id="log"></pre>
+      </section>
+
+      <section>
+        <label for="statsDump">Filtered getStats() JSON</label>
+        <textarea id="statsDump" readonly spellcheck="false"></textarea>
+      </section>
+    </main>
+
+    <script type="module">
+      import {
+        attachReceiver,
+        chooseAdvertiseIp,
+        collectPeerDiagnostics,
+        createPeerConnection,
+        getSignalInfo,
+        logger,
+        putSignal,
+        rewriteMdnsHostCandidates,
+        sendP2clawRequests,
+        setStatus,
+        startStats,
+        stringifyDescription,
+        waitForIceGatheringComplete,
+        waitForSendOptions,
+        waitForSignal,
+        waitForSignalMatch,
+      } from "./shared.js?v=24";
+
+      const els = {
+        advertiseIp: document.querySelector("#advertiseIp"),
+        answer: document.querySelector("#answer"),
+        currentStats: document.querySelector("#currentStats"),
+        join: document.querySelector("#join"),
+        log: document.querySelector("#log"),
+        offer: document.querySelector("#offer"),
+        rewriteMdns: document.querySelector("#rewriteMdns"),
+        room: document.querySelector("#room"),
+        sendDiagnostics: document.querySelector("#sendDiagnostics"),
+        statsDump: document.querySelector("#statsDump"),
+        status: document.querySelector("#status"),
+        useStun: document.querySelector("#useStun"),
+      };
+
+      const log = logger(els.log);
+      let pc;
+      let sessionId = null;
+      let senderOptions = null;
+      let receivedCount = 0;
+      let sentRequestCount = 0;
+      const receivedLabels = new Set();
+
+      initAdvertiseIp();
+      els.join.addEventListener("click", joinReceiver);
+      els.sendDiagnostics.addEventListener("click", sendDiagnostics);
+
+      async function joinReceiver() {
+        els.join.disabled = true;
+        resetPage();
+        const room = roomName();
+
+        try {
+          pc = createPeerConnection(log, { useStun: els.useStun.checked });
+          startStats(pc, log, els.currentStats, els.statsDump);
+
+          pc.addEventListener("datachannel", (event) => {
+            const dc = event.channel;
+            dc.binaryType = "arraybuffer";
+            log("dc", `created label=${dc.label} id=${dc.id}`);
+            attachReceiver(dc, log, noteReceived);
+            dc.addEventListener("open", async () => {
+              log("dc", "open");
+              if (senderOptions?.payloadMode === "p2claw") {
+                setStatus(els.status, "Data channel open. Sending p2claw requests.");
+                await sendP2clawRequests(dc, log, noteRequestSent, senderOptions);
+                setStatus(els.status, `Sent ${sentRequestCount} p2claw request(s). Waiting for responses.`);
+              } else {
+                setStatus(els.status, "Data channel open. Waiting for raw test messages.");
+              }
+            });
+            dc.addEventListener("close", () => log("dc", "close"));
+            dc.addEventListener("error", (err) => log("dc", err.error?.message || "error"));
+          });
+
+          setStatus(els.status, "Waiting for fresh sender session.");
+          const freshAfter = Date.now() / 1000 - 30;
+          const session = await waitForSignalMatch(
+            room,
+            "session",
+            log,
+            (value, envelope) => Boolean(value?.id) && envelope.ts >= freshAfter,
+          );
+          sessionId = session.id;
+          log("signal", `using session ${sessionId}`);
+
+          setStatus(els.status, "Waiting for sender offer.");
+          const offer = await waitForSignal(room, "offer", log);
+          senderOptions = await waitForSendOptions(room, log, { sessionId });
+          els.offer.value = stringifyDescription(offer);
+          await pc.setRemoteDescription(offer);
+
+          await pc.setLocalDescription(await pc.createAnswer());
+          els.answer.value = stringifyDescription(pc.localDescription);
+          setStatus(els.status, "Answer created. Waiting briefly for ICE candidates.");
+
+          const iceResult = await waitForIceGatheringComplete(pc, 5000);
+          let answer = { type: pc.localDescription.type, sdp: pc.localDescription.sdp, mreSession: sessionId };
+          if (els.rewriteMdns.checked) {
+            answer = { ...rewriteMdnsHostCandidates(answer, els.advertiseIp.value.trim(), log), mreSession: sessionId };
+          }
+          els.answer.value = stringifyDescription(answer);
+          await putSignal(room, "answer", answer);
+          log("signal", `published answer after ICE ${iceResult}`);
+          setStatus(els.status, "Answer published. Waiting for the data channel to open.");
+        } catch (error) {
+          log("error", error.stack || error.message);
+          setStatus(els.status, error.message);
+        } finally {
+          els.join.disabled = false;
+        }
+      }
+
+      function resetPage() {
+        if (pc) pc.close();
+        pc = null;
+        sessionId = null;
+        senderOptions = null;
+        receivedCount = 0;
+        sentRequestCount = 0;
+        receivedLabels.clear();
+        els.answer.value = "";
+        els.offer.value = "";
+        els.log.textContent = "";
+        els.statsDump.value = "";
+        els.currentStats.textContent = "No stats yet.";
+        els.sendDiagnostics.disabled = false;
+      }
+
+      function noteRequestSent() {
+        sentRequestCount += 1;
+      }
+
+      function noteReceived(msg) {
+        receivedCount += 1;
+        const label = msg.p2claw
+          ? `p2claw-${msg.p2claw.kind}-${msg.p2claw.streamId}`
+          : msg.label;
+        receivedLabels.add(label);
+        const labels = Array.from(receivedLabels).join(", ");
+        setStatus(els.status, `Received ${receivedCount} message(s): ${labels}`);
+      }
+
+      async function sendDiagnostics() {
+        els.sendDiagnostics.disabled = true;
+        const traceLog = els.log.textContent;
+        try {
+          const peer = await collectPeerDiagnostics(pc).catch((error) => ({ error: error.message }));
+          const report = {
+            role: "answerer",
+            capturedAt: new Date().toISOString(),
+            room: roomName(),
+            sessionId,
+            href: location.href,
+            userAgent: navigator.userAgent,
+            platform: navigator.platform,
+            controls: {
+              advertiseIp: els.advertiseIp.value.trim(),
+              rewriteMdns: els.rewriteMdns.checked,
+              useStun: els.useStun.checked,
+            },
+            status: els.status.textContent,
+            currentStats: els.currentStats.textContent,
+            counters: {
+              receivedCount,
+              sentRequestCount,
+              receivedLabels: Array.from(receivedLabels),
+            },
+            senderOptions,
+            offer: parseMaybeJson(els.offer.value),
+            answer: parseMaybeJson(els.answer.value),
+            traceLog,
+            statsDump: parseMaybeJson(els.statsDump.value),
+            peer,
+          };
+
+          const response = await fetch("/diagnostics", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(report),
+          });
+          const data = await response.json();
+          if (!response.ok || !data.ok) throw new Error(data.error || `Diagnostics upload failed: ${response.status}`);
+          log("diag", `uploaded ${data.id} to ${data.path}`);
+          setStatus(els.status, `Diagnostics uploaded: ${data.id}`);
+        } catch (error) {
+          log("error", error.stack || error.message);
+          setStatus(els.status, error.message);
+        } finally {
+          els.sendDiagnostics.disabled = false;
+        }
+      }
+
+      async function initAdvertiseIp() {
+        try {
+          const info = await getSignalInfo();
+          const ip = chooseAdvertiseIp(info, "answerer");
+          els.advertiseIp.value = ip;
+          log("signal", `advertise receiver IP default=${ip || "none"}`);
+        } catch (error) {
+          log("error", error.message);
+        }
+      }
+
+      function roomName() {
+        return els.room.value.trim() || "mre";
+      }
+
+      function parseMaybeJson(text) {
+        const trimmed = text.trim();
+        if (!trimmed) return null;
+        try {
+          return JSON.parse(trimmed);
+        } catch {
+          return trimmed;
+        }
+      }
+    </script>
+  </body>
+</html>
