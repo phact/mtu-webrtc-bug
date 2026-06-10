@@ -9,6 +9,16 @@ On a path that drops or refuses fragments, small messages are
 delivered fine and **no fragmented message is ever delivered**, with
 no error surfaced to either side.
 
+One such path turned out to be neither rare nor transient: **Tailscale
+drops every IPv6 fragment, on every platform, by design** — its packet
+filter classifies the v6 Fragment extension header as an unmatchable
+protocol and default-denies it (see
+`diagnostics/who-loses-the-packets.md`). Any webrtc-rs data channel
+whose ICE-nominated pair is Tailscale-over-IPv6 therefore stalls
+deterministically on the first full-size message. The
+`blackhole-relay` below reproduces the same failure with no VPN and no
+second device.
+
 ## The mechanism
 
 `webrtc-sctp` fragments outgoing user messages against a hardcoded,
@@ -47,11 +57,14 @@ the receiver gets nothing, the session eventually dies. It presents as
 built chasing exactly that, in production: an iPad on Tailscale where
 the receiver's wire counters froze at ~2 KB while the sender's buffer
 sat full, i.e. the fragments demonstrably never arrived. The receiver
-(WebKit) was innocent, and the fragment-dropping condition on that
-path has since disappeared and resists re-creation — which is the
-point: a sender that depends on fragmentation fails at the mercy of
-path conditions it can neither see nor control. `blackhole-relay`
-below models the fragment-hostile case deterministically.
+(WebKit) was innocent. The fragment-dropper was eventually identified
+as Tailscale's own inbound packet filter (deterministic on IPv6
+pairs; the earlier impression that the condition "came and went" was
+the ICE pair lottery — v4 and LAN pairs deliver, the v6 pair never
+does). The point stands in general: a sender that depends on
+fragmentation fails at the mercy of path conditions it can neither
+see nor control. `blackhole-relay` below models the fragment-hostile
+case with no VPN required.
 
 ## One-command repro (Linux, no VPN, no extra devices)
 
@@ -110,27 +123,43 @@ addresses to the tunnel (the picker prefers the Tailscale addresses,
 v6 first; loading the answerer via `http://[<v6 addr>]:8000/` forces
 the v6 pair).
 
-Caveat from our own attempts: a real tunnel only reproduces the stall
-**while its path is fragment-hostile**. On a healthy path the sender's
-kernel fragments at the tun and the receiver reassembles, so all
-frames arrive (we verified this with tcpdump on both the v4 and v6
-Tailscale pairs — including the exact pair that failed in production
-weeks earlier). The production failure mode is real (receiver wire
-counters frozen while the sender buffer sat full: fragments never
-arrived) but the path condition that caused it is transient and may
-not be present when you test. That is why `blackhole-relay` exists:
-it makes the fragment-hostile case deterministic. If the tunnel run
-does stall for you, capture `pc.getStats()` on the receiver — the data
-channel's `messagesReceived` freezing while transport bytes stop is
-the signature.
+On Tailscale the outcome is decided entirely by which pair gets
+nominated: the **IPv6 pair stalls deterministically** (Tailscale's
+inbound filter drops all v6 fragments — see
+`diagnostics/who-loses-the-packets.md`), the **IPv4 pair delivers**
+(v4 fragments get real filter support and reassemble), and a LAN pair
+never fragments at all (1500 MTU). So verify the nominated pair is
+the v6 tunnel pair before reading anything into a pass. A note of
+caution from our own two weeks in the desert: a sender-side tcpdump
+showing fragments leaving the tun proves only that they *left* — we
+"verified the path healthy" that way while the receiver's filter was
+eating both fragments of every message. Watch the receiver.
 
-A captured instance of this on a real Tailscale IPv6 link is checked in
-at `diagnostics/tailscale-v6-blackhole.pcap` (see `diagnostics/README.md`):
+You can pre-check whether your tunnel is fragment-hostile with no
+WebRTC at all:
+
+```sh
+ping -c 3 -s 100  <peer-tailscale-v6>   # delivered
+ping -c 3 -s 1400 <peer-tailscale-v6>   # 100% loss: fragments dropped
+ping -c 3 -s 1400 <peer-tailscale-v4>   # delivered: v4 fragments are fine
+```
+
+On the receiving node, `tailscale metrics print` shows
+`tailscaled_inbound_dropped_packets_total{reason="acl"}` advancing by
+exactly two per lost ping (both fragments), even on an allow-all
+tailnet.
+
+If the tunnel run stalls for you, capture `pc.getStats()` on the
+receiver — the data channel's `messagesReceived` freezing while
+transport bytes stop is the signature.
+
+A captured instance on a real Tailscale IPv6 link is checked in at
+`diagnostics/tailscale-v6-blackhole.pcap` (see `diagnostics/README.md`):
 the sender's kernel fragments the 1265-byte SCTP packet into `1232|41`
 and retransmits the identical chunk with T3-rtx backoff, never acked,
-while small datagrams keep flowing both ways. What that capture does
-*not* settle — who actually drops the fragments — is written up in
-`diagnostics/who-loses-the-packets.md`.
+while small datagrams keep flowing both ways. Who drops the fragments
+is settled in `diagnostics/who-loses-the-packets.md`: Tailscale's
+inbound packet filter, by design, on every platform.
 
 ## Fix directions (upstream)
 

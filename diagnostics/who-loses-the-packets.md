@@ -212,9 +212,10 @@ platform. Two consequences follow for this repro:
 - On a Tailscale **IPv6** pair, the webrtc-rs stall is not transient or
   path-dependent — it is **deterministic**. Any SCTP packet over the
   ~1232-byte fragmentation threshold wedges the channel, every time.
-  (The "condition that resists re-creation" in the top-level README was
-  an artifact of sender-side captures: the fragments always left; they
-  were always eaten on arrival.)
+  (Earlier revisions of the top-level README described the condition
+  as transient and hard to re-create; that was an artifact of
+  sender-side captures: the fragments always left; they were always
+  eaten on arrival.)
 - `webrtc-rs` remains the accomplice that makes the design decision
   fatal: it is the rare stack that emits UDP datagrams needing v6
   fragmentation, and it has no mechanism — no PMTUD, no probe, no
