@@ -124,6 +124,14 @@ does stall for you, capture `pc.getStats()` on the receiver — the data
 channel's `messagesReceived` freezing while transport bytes stop is
 the signature.
 
+A captured instance of this on a real Tailscale IPv6 link is checked in
+at `diagnostics/tailscale-v6-blackhole.pcap` (see `diagnostics/README.md`):
+the sender's kernel fragments the 1265-byte SCTP packet into `1232|41`
+and retransmits the identical chunk with T3-rtx backoff, never acked,
+while small datagrams keep flowing both ways. What that capture does
+*not* settle — who actually drops the fragments — is written up in
+`diagnostics/who-loses-the-packets.md`.
+
 ## Fix directions (upstream)
 
 - Lower the default so the worst-case wire packet fits 1280:

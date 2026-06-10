@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 target/
 node_modules/
-diagnostics/
-# working notes for the upstream issue; not part of the public repro
+# working notes for the upstream issues; not part of the public repro
 webrtc-rs-issue-draft.md
+tailscale-issue-draft.md
 .blackhole-logs/
